@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: 2010-09-09
+# This template is for the deployment of a Sigfox callback interface to AWS IoT for Downlink communication
+Transform: 'AWS::Serverless-2016-10-31'
+Parameters:
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: 'Public Subnets where the ALB will be deployed.'
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: 'VPC containing the Public subnets'
+  Certificate:
+    Type: String
+    Description: 'ARN of the certificate to be used for HTTPS configuration of the ALB (Leave blank for HTTP deployment).'
+    Default: ''
+  SigfoxUsername:
+    Type: String
+    Description: 'Username for the Sigfox callback authentication (Use any value an Basic Authentication header will be generated and provided to you in output).'
+  SigfoxPassword:
+    Type: String
+    Description: 'Password for the Sigfox callback authentication (Use any value an Basic Authentication header will be generated and provided to you in output).'
+    NoEcho: true
+  SigfoxTopic:
+    Type: String
+    Description: 'Topic used to communicate to the Sigfox devices.'
+    Default: 'sigfox/downlink/+'
+  SigfoxDownlinkFieldName:
+    Type: String
+    Description: 'Name of the field that will contain the downlinkData.'
+    Default: 'downlinkData'
+  SigfoxDeviceId:
+    Type: String
+    Description: 'SQL function or message attribute used map the Device ID.'
+    Default: 'topic(3)'
+  SigfoxSourceIP:
+    Type: String
+    Description: 'Source IP of the Sigfox backend.'
+    Default: '185.110.96.0/22'
+Conditions:
+  NoSSL: !Equals
+  # Condition used for HTTP/HTTPS Deployment
+    - Ref: Certificate
+    - ''
+Resources:
+  sigfoxDownlinkLambda:
+  # Lambda function providing messages to the Sigfox platform on callback
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Role: !GetAtt sigfoxDownlinkLambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Select
+            - 1
+            - !Split
+              - /
+              - !GetAtt sigfoxDownlinkDynamodb.Arn
+          SECRETNAME: !Ref sigfoxCallbackSecret
+      InlineCode: >
+
+        //Load the Environment variables
+
+        let table = process.env.TABLE_NAME;
+
+        let secret=process.env.SECRETNAME;
+
+        const AWS = require('aws-sdk');
+
+        // Create a Document Client for DynamoDB
+
+        const docClient = new AWS.DynamoDB.DocumentClient();
+
+        // Create a Secrets Manager client
+
+        var smclient = new AWS.SecretsManager();
+
+        // Parameter variable for the DDB Queries
+
+        var params = {};
+
+        // Secrets retrieval Function
+
+        async function mySecrets(secretName) {
+
+            return new Promise((resolve,reject)=>{
+                smclient.getSecretValue({SecretId: secretName}, function(err, data) {
+                    // In this sample we only handle the specific exceptions for the 'GetSecretValue' API.
+                    // See https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+                    // We rethrow the exception by default.
+                    if (err) {
+                        reject(err);
+                    }
+                    else {
+                        // Decrypts secret using the associated KMS CMK.
+                        // Depending on whether the secret is a string or binary, one of these fields will be populated.
+                        if ('SecretString' in data) {
+                            resolve(data.SecretString);
+                        } else {
+                            let buff = new Buffer(data.SecretBinary, 'base64');
+                            resolve(buff.toString('ascii'));
+                        }
+                    }
+                });
+            });
+        }
+
+        // DDB Item retrieval Function
+
+        async function getItem(){
+          try {
+            const data = await docClient.get(params).promise();
+            return data;
+          } catch (err) {
+            return err;
+          }
+        }
+
+        // DDB Item deletion  Function
+
+        async function deleteItem(){
+          try{
+            await docClient.delete(params).promise();
+          }catch (err) {
+            return err;
+          }
+        }
+
+        exports.handler = async (event, context) => {
+          // Configure authentication
+          var value = await mySecrets(secret);
+          const authUser=JSON.parse(value)["username"];
+          const authPass=JSON.parse(value)["password"];
+          const authString = 'Basic ' + new Buffer(authUser + ':' + authPass).toString('base64');
+
+          const headers = event.headers;
+          if (typeof headers["authorization"] == 'undefined' || headers["authorization"] != authString) {
+                  const body = 'Unauthorized';
+                  const response = {
+                      status: '401',
+                      statusDescription: 'Unauthorized',
+                      body: body,
+                      headers: {
+                          'www-authenticate': [{key: 'WWW-Authenticate', value:'Basic'}]
+                      },
+                  };
+            return response;
+          }
+          const body = event.body ? JSON.parse(event.body) : {};
+          const device = body.id || null;
+
+          params = {
+            TableName : table,
+            /* Get the messageage in queue for device */
+            Key: {
+              id: device
+            }
+          };
+
+
+          try {
+            const data = await getItem();
+            await deleteItem();
+            console.log(data["Item"]);
+            const bdy='{"'+data["Item"]["id"]+'":{"downlinkData":"'+data["Item"]["downlinkData"]+'"}}';
+            return { statusCode: 200,
+              body: bdy };
+          } catch (err) {
+            console.log("No message for device "+device);
+            return { statusCode: 204 };
+          }
+        };
+
+  sigfoxDownlinkLambdaRole:
+  # Execution role for the lambda function Allows logs and any action on the DDB table.
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: sigfoxDownlinkLambdaRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:*'
+                Resource: !GetAtt sigfoxDownlinkDynamodb.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref sigfoxCallbackSecret
+
+  sigfoxDownlinkIoTRole:
+  # Execution role for the IoT core rule. Allows logs and any action on the DDB table.
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: dynamodbAccessRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:*'
+                Resource: !GetAtt sigfoxDownlinkDynamodb.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:*'
+                Resource: '*'
+
+
+  sigfoxDownlinkDynamodb:
+  # Dynamodb table used for storing messages. (as the partition key is the Device ID, it will keep only the last message and provide it until the item is deleted.)
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TableName: !Join
+        - ''
+        - - Ref: 'AWS::StackName'
+          - '-sigfoxDownlinkTable'
+
+
+  sigfoxDownlinkAlb:
+  # Load balancer for incoming callback.
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !Ref sigfoxDownlinkSecurityGroup
+
+
+  sigfoxDownlinkTargetGroup:
+  # Target group routing to the Lambda function.
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn: sigfoxDownlinkLambdaPermission
+    Properties:
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt sigfoxDownlinkLambda.Arn
+
+
+  sigfoxDownlinkHttpListener:
+  # HTTP or HTTPS listener based on the Certificate parametter.
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      LoadBalancerArn: !Ref sigfoxDownlinkAlb
+      Port: !If
+        - NoSSL
+        - 80
+        - 443
+      Protocol: !If
+        - NoSSL
+        - HTTP
+        - HTTPS
+      Certificates:
+        - CertificateArn: !If
+            - NoSSL
+            - !Ref 'AWS::NoValue'
+            - !Ref Certificate
+      DefaultActions:
+        - TargetGroupArn: !Ref sigfoxDownlinkTargetGroup
+          Type: forward
+
+
+  sigfoxDownlinkSecurityGroup:
+  # Security group for the ALB. Source IPs are limited to the Sigfox backend 185.110.96.0/22 (https://support.sigfox.com/docs/callback-integration).
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow http on port 80 or 443 based on configuration
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If
+            - NoSSL
+            - 80
+            - 443
+          ToPort: !If
+            - NoSSL
+            - 80
+            - 443
+          CidrIp: !Ref SigfoxSourceIP
+
+
+  sigfoxDownlinkLambdaPermission:
+  # Lambda function policy allowing the ALB to invoke the function upon request.
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt sigfoxDownlinkLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: elasticloadbalancing.amazonaws.com
+
+
+  sigfoxDownlinkRule:
+  # IoT Core rule to store the messages in the DDB table based on a set of topics.
+    Type: 'AWS::IoT::TopicRule'
+    Properties:
+      RuleName: !Join
+        - ''
+        - - Ref: 'AWS::StackName'
+          - sigfoxDownlinkRule
+      TopicRulePayload:
+        RuleDisabled: 'false'
+        Sql:
+          'Fn::Join':
+            - ''
+            - - 'SELECT '
+              - !Ref SigfoxDownlinkFieldName
+              - ' as downlinkData, '
+              - !Ref SigfoxDeviceId
+              - ' as id, timestamp() as timestamp,
+              principal() as sender FROM '''
+              - !Ref SigfoxTopic
+              - ''''
+        Actions:
+          - DynamoDBv2:
+              PutItem:
+                TableName: !Select
+                  - 1
+                  - !Split
+                    - /
+                    - !GetAtt sigfoxDownlinkDynamodb.Arn
+              RoleArn:
+                'Fn::GetAtt':
+                  - sigfoxDownlinkIoTRole
+                  - Arn
+
+  sigfoxCallbackSecret:
+  # Secret storing the password for Sigfox anthentication
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Description: 'Sigfox Callback Credentials'
+      Name: !Join
+        - ''
+        - - 'sigfox/callback/'
+          - Ref: 'AWS::StackName'
+          - '-sigfoxauthsecret'
+      SecretString: !Join
+        - ''
+        - - '{"username":"'
+          - !Ref SigfoxUsername
+          - '","password":"'
+          - !Ref SigfoxPassword
+          - '"}'
+
+Outputs:
+  URL:
+  # Url to be configured in sigfox backend.
+    Value: !If
+      - NoSSL
+      - 'Fn::Join':
+        - ''
+        - - 'http://'
+          - !GetAtt sigfoxDownlinkAlb.DNSName
+      - 'Fn::Join':
+        - ''
+        - - 'https://'
+          - !GetAtt sigfoxDownlinkAlb.DNSName
+
+  AuthenticationHeader:
+  # Authentication Header to be configured in sigfox backend.
+    Value:
+      'Fn::Join':
+        - ' '
+        - - 'Basic '
+          - !Base64
+            'Fn::Join':
+              - ''
+              - - !Ref SigfoxUsername
+                - ':'
+                - !Ref SigfoxPassword
