@@ -21,7 +21,7 @@ The repository consists of a master template. Run the master template to create 
 Please refer to [history.md](/history.md) for a detailed list of changes.
 
 ## Steps to Run
-To launch the entire stack and deploy a Sigfox Callback API for downlink messages on AWS, download the [Master template](/template/aws-sigfox-master.yaml) and launch a stack with it in Cloudformation.
+To launch the entire stack and deploy a Sigfox Callback API for downlink messages on AWS, download the [Master template](/templates/aws-sigfox-master.yaml) and launch a stack with it in Cloudformation.
 
 
 #### Optional: Amazon Certificate Manager SSL/TLS Certificates
